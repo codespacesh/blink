@@ -7,9 +7,10 @@ import type { App } from "@slack/bolt";
 import { convertToModelMessages, type LanguageModel, type Tool } from "ai";
 import type * as blink from "blink";
 import {
-  DEFAULT_HARD_TOKEN_THRESHOLD,
-  DEFAULT_SOFT_TOKEN_THRESHOLD,
-  processCompaction,
+  applyCompactionToMessages,
+  createCompactionMarkerPart,
+  createCompactionTool,
+  isOutOfContextError,
 } from "./compaction";
 import {
   type CoderApiClient,
@@ -60,28 +61,11 @@ export interface BuildStreamTextParamsOptions {
    */
   getGithubAppContext?: () => Promise<github.AppAuthOptions | undefined>;
   /**
-   * Configuration for conversation compaction.
-   * If not provided, compaction features are enabled with default thresholds.
-   * Set to `false` to disable compaction entirely.
+   * Whether to enable conversation compaction. When enabled, the compact_conversation tool
+   * will be included and compaction state in messages will be handled automatically.
+   * Default: true
    */
-  compaction?:
-    | {
-        /**
-         * Soft token threshold at which to trigger compaction.
-         * When the conversation exceeds this threshold, a message is injected
-         * asking the model to call the compact_conversation tool.
-         * Default: 180 000 tokens
-         */
-        softThreshold?: number;
-        /**
-         * Hard token threshold - max tokens to send for compaction.
-         * Messages beyond this limit are preserved and restored after compaction.
-         * Must be greater than softThreshold.
-         * Default: 190 000 tokens
-         */
-        hardThreshold?: number;
-      }
-    | false;
+  compaction?: boolean;
 }
 
 interface Logger {
@@ -354,7 +338,7 @@ export class Scout {
     tools: providedTools,
     getGithubAppContext,
     systemPrompt = defaultSystemPrompt,
-    compaction: compactionConfig,
+    compaction = true,
   }: BuildStreamTextParamsOptions): Promise<{
     model: LanguageModel;
     messages: ModelMessage[];
@@ -375,28 +359,10 @@ export class Scout {
         )()
       : undefined;
 
-    // Process compaction if enabled
-    const compactionEnabled = compactionConfig !== false;
-    const softTokenThreshold =
-      (compactionConfig !== false
-        ? compactionConfig?.softThreshold
-        : undefined) ?? DEFAULT_SOFT_TOKEN_THRESHOLD;
-    const hardTokenThreshold =
-      (compactionConfig !== false
-        ? compactionConfig?.hardThreshold
-        : undefined) ?? DEFAULT_HARD_TOKEN_THRESHOLD;
-
-    const { messages: compactedMessages, compactionTool } = compactionEnabled
-      ? await processCompaction({
-          messages,
-          softTokenThreshold,
-          hardTokenThreshold,
-          model,
-          logger: this.logger,
-        })
-      : { messages, compactionTool: {} };
-
-    const slackMetadata = getSlackMetadata(compactedMessages);
+    // it's important to look in the original messages, not the processed messages
+    // the processed ones may have been compacted and not include slack metadata
+    // anymore
+    const slackMetadata = getSlackMetadata(messages);
     const respondingInSlack =
       this.slack.app !== undefined && slackMetadata !== undefined;
 
@@ -497,7 +463,6 @@ export class Scout {
     }
 
     const tools = {
-      ...compactionTool,
       ...(this.webSearch.config
         ? createWebSearchTools({ exaApiKey: this.webSearch.config.exaApiKey })
         : {}),
@@ -512,6 +477,8 @@ export class Scout {
           })
         : undefined),
       ...computeTools,
+      // Always include compaction tool when compaction is enabled (for caching purposes)
+      ...(compaction ? createCompactionTool() : {}),
       ...providedTools,
     };
 
@@ -524,7 +491,11 @@ ${slack.formattingRules}
 </formatting-rules>`;
     }
 
-    const converted = convertToModelMessages(compactedMessages, {
+    const messagesToConvert = compaction
+      ? applyCompactionToMessages(messages)
+      : messages;
+
+    const converted = convertToModelMessages(messagesToConvert, {
       ignoreIncompleteToolCalls: true,
       tools,
     });
@@ -548,5 +519,108 @@ ${slack.formattingRules}
       providerOptions,
       tools: withModelIntent(tools),
     };
+  }
+
+  /**
+   * Process the output from streamText, intercepting out-of-context errors
+   * and replacing them with compaction markers.
+   *
+   * @param stream - The StreamTextResult from the AI SDK's streamText()
+   * @param options - Optional callbacks
+   * @returns The same stream, but with toUIMessageStream wrapped to handle errors
+   */
+  processStreamTextOutput<
+    // biome-ignore lint/suspicious/noExplicitAny: toUIMessageStream has complex overloaded signature
+    T extends { toUIMessageStream: (...args: any[]) => any },
+  >(
+    stream: T,
+    options?: {
+      onCompactionTriggered?: () => void;
+    }
+  ): T {
+    // Use a Proxy to wrap toUIMessageStream
+    return new Proxy(stream, {
+      get(target, prop) {
+        // Wrap toUIMessageStream to intercept out-of-context errors
+        if (prop === "toUIMessageStream") {
+          const originalMethod = target.toUIMessageStream;
+          return (...args: unknown[]) => {
+            const uiStream = originalMethod.apply(target, args);
+
+            // Helper to emit compaction marker chunks
+            const emitCompactionMarker = (
+              controller: ReadableStreamDefaultController
+            ) => {
+              options?.onCompactionTriggered?.();
+              const markerPart = createCompactionMarkerPart();
+              controller.enqueue({
+                type: "tool-input-start",
+                toolCallId: markerPart.toolCallId,
+                toolName: markerPart.toolName,
+              });
+              controller.enqueue({
+                type: "tool-input-available",
+                toolCallId: markerPart.toolCallId,
+                toolName: markerPart.toolName,
+                input: markerPart.input,
+              });
+              controller.enqueue({
+                type: "tool-output-available",
+                toolCallId: markerPart.toolCallId,
+                output: markerPart.output,
+                preliminary: false,
+              });
+            };
+
+            // Use a custom ReadableStream to handle both error chunks and mid-stream errors
+            // This approach catches errors from controller.error() which TransformStream doesn't handle
+            return new ReadableStream({
+              async start(controller) {
+                const reader = uiStream.getReader();
+                try {
+                  while (true) {
+                    const { done, value: chunk } = await reader.read();
+                    if (done) break;
+
+                    // Check if this is an error chunk in UI format
+                    if (
+                      chunk &&
+                      typeof chunk === "object" &&
+                      "type" in chunk &&
+                      chunk.type === "error" &&
+                      "errorText" in chunk &&
+                      typeof chunk.errorText === "string" &&
+                      isOutOfContextError(new Error(chunk.errorText))
+                    ) {
+                      emitCompactionMarker(controller);
+                      continue;
+                    }
+                    controller.enqueue(chunk);
+                  }
+                  controller.close();
+                } catch (error) {
+                  // Mid-stream error via controller.error() - check if it's out of context
+                  if (isOutOfContextError(error)) {
+                    emitCompactionMarker(controller);
+                    controller.close();
+                  } else {
+                    controller.error(error);
+                  }
+                } finally {
+                  reader.releaseLock();
+                }
+              },
+            });
+          };
+        }
+
+        const value = target[prop as keyof T];
+        // Bind functions to the original target to preserve 'this' context
+        if (typeof value === "function") {
+          return value.bind(target);
+        }
+        return value;
+      },
+    }) as T;
   }
 }

@@ -1,191 +1,56 @@
-import {
-  convertToModelMessages,
-  type LanguageModel,
-  type ModelMessage,
-  type Tool,
-  tool,
-} from "ai";
+import { type Tool, tool } from "ai";
 import { z } from "zod";
-import type { Logger, Message } from "./types";
+import type { Message } from "./types";
+
+// Constants
+export const COMPACTION_MARKER_TOOL_NAME = "__compaction_marker";
+export const COMPACT_CONVERSATION_TOOL_NAME = "compact_conversation";
+
+// Error patterns for out-of-context detection (regex)
+const OUT_OF_CONTEXT_PATTERNS = [
+  /context.*(length|limit|window|exceeded)/i,
+  /token.*(limit|exceeded|maximum)/i,
+  /maximum.*context/i,
+  /input.*too.*long/i,
+  /prompt.*too.*long/i,
+  // Anthropic specific
+  /max_tokens_exceeded/i,
+  // OpenAI specific
+  /context_length_exceeded/i,
+  /maximum.*tokens/i,
+];
 
 /**
- * Tool name for conversation compaction.
- * Used to identify compaction tool results in message history.
+ * Check if an error is an out-of-context error based on known patterns.
  */
-export const COMPACT_CONVERSATION_TOOL_NAME = "compact_conversation" as const;
+export function isOutOfContextError(error: unknown): boolean {
+  let message: string;
 
-/**
- * Default soft token threshold for triggering compaction.
- * When conversation tokens reach this limit, compaction is triggered.
- */
-export const DEFAULT_SOFT_TOKEN_THRESHOLD = 180_000;
-
-/**
- * Default hard token threshold for compaction.
- * Messages beyond this limit are excluded from compaction and preserved.
- * Must be greater than soft threshold.
- */
-export const DEFAULT_HARD_TOKEN_THRESHOLD = 190_000;
-
-/**
- * Get the model configuration for token counting.
- * Defaults to Claude Sonnet if model not found.
- */
-function getModelConfig(models: Record<string, unknown>, modelName: string) {
-  // Try to find exact match first
-  if (modelName in models) {
-    return models[modelName as keyof typeof models];
-  }
-  // Default to Claude Sonnet for Anthropic models
-  if (modelName.includes("anthropic") || modelName.includes("claude")) {
-    return models["anthropic/claude-sonnet-4"];
-  }
-  // Default to GPT-5 for OpenAI models
-  if (modelName.includes("openai") || modelName.includes("gpt")) {
-    return models["openai/gpt-5"];
-  }
-  // Fallback
-  return models["anthropic/claude-sonnet-4"];
-}
-
-/**
- * Result of counting tokens for messages.
- */
-export interface TokenCountResult {
-  /** Total tokens across all messages */
-  total: number;
-  /** Token count for each message */
-  perMessage: number[];
-}
-
-/**
- * Counts tokens for messages using ai-tokenizer.
- * Returns both total and per-message token counts for efficient processing.
- */
-export async function countConversationTokens(
-  messages: ModelMessage[],
-  modelName: string = "anthropic/claude-sonnet-4"
-): Promise<TokenCountResult> {
-  // we import the modules dynamically because otherwise the
-  // agent starts up super slow and blink cloud times out during deployment
-  const aiTokenizer = await import("ai-tokenizer");
-  const encoding = await import("ai-tokenizer/encoding/o200k_base");
-  const tokenizerSdk = await import("ai-tokenizer/sdk");
-
-  const model = getModelConfig(aiTokenizer.models, modelName);
-  const tokenizer = new aiTokenizer.Tokenizer(encoding);
-
-  const result = tokenizerSdk.count({
-    // biome-ignore lint/suspicious/noExplicitAny: weird typing error
-    tokenizer: tokenizer as any,
-    // biome-ignore lint/suspicious/noExplicitAny: weird typing error
-    model: model as any,
-    messages,
-  });
-
-  return {
-    total: result.total,
-    perMessage: result.messages.map((m) => m.total),
-  };
-}
-
-/**
- * Finds the most recent compaction summary in the message history.
- * Returns the index of the message containing the compaction, the summary text,
- * and optionally the preserved message IDs.
- */
-export function findCompactionSummary(messages: Message[]): {
-  index: number;
-  summary: string;
-  preservedMessageIds?: string[];
-} | null {
-  // Search from the end to find the most recent compaction
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const message = messages[i];
-    if (message?.role !== "assistant") {
-      continue;
-    }
-
-    for (const part of message.parts) {
-      // Check if this is our compaction tool
-      if (part.type === `tool-${COMPACT_CONVERSATION_TOOL_NAME}`) {
-        const toolPart = part as {
-          state: string;
-          output?: { summary?: string; preservedMessageIds?: string[] };
-        };
-        if (toolPart.state === "output-available" && toolPart.output?.summary) {
-          return {
-            index: i,
-            summary: toolPart.output.summary,
-            preservedMessageIds: toolPart.output.preservedMessageIds,
-          };
-        }
-      }
-    }
-  }
-  return null;
-}
-
-/**
- * Processes messages to apply compaction if a compaction summary exists.
- * Returns messages with history before the compaction replaced by a summary message.
- */
-export function applyCompaction(messages: Message[]): Message[] {
-  const compaction = findCompactionSummary(messages);
-  if (!compaction) {
-    return messages;
-  }
-
-  // Create a synthetic user message with the compacted summary
-  const summaryMessage: Message = {
-    id: "compaction-summary",
-    role: "user",
-    parts: [
-      {
-        type: "text",
-        text: `[CONVERSATION SUMMARY - Previous messages have been compacted to save context space]\n\n${compaction.summary}\n\n[END OF SUMMARY - Conversation continues below]`,
-      },
-    ],
-  };
-
-  // Get messages after the compaction point (excludes the compaction tool call itself)
-  const messagesAfterCompaction = messages.slice(compaction.index + 1);
-
-  // Check for preserved message IDs (from hard threshold truncation)
-  if (
-    compaction.preservedMessageIds &&
-    compaction.preservedMessageIds.length > 0
+  if (error instanceof Error) {
+    message = error.message;
+  } else if (typeof error === "string") {
+    message = error;
+  } else if (
+    error !== null &&
+    typeof error === "object" &&
+    "message" in error &&
+    typeof error.message === "string"
   ) {
-    // Keep summary + preserved messages by ID + messages after compaction
-    const preservedIdSet = new Set(compaction.preservedMessageIds);
-    const preserved = messages.filter((m) => preservedIdSet.has(m.id));
-
-    // Combine preserved messages with messages after compaction (deduplicated)
-    const afterCompactionIds = new Set(
-      messagesAfterCompaction.map((m) => m.id)
-    );
-    const preservedNotInAfter = preserved.filter(
-      (m) => !afterCompactionIds.has(m.id)
-    );
-
-    return [summaryMessage, ...preservedNotInAfter, ...messagesAfterCompaction];
+    message = error.message;
+  } else {
+    return false;
   }
 
-  // Normal compaction: keep messages from the compaction point onwards
-  return [summaryMessage, ...messagesAfterCompaction];
+  return OUT_OF_CONTEXT_PATTERNS.some((pattern) => pattern.test(message));
 }
 
 /**
- * Creates the compact_conversation tool.
- * This tool should be called by the model when the conversation is getting too long.
- *
- * @param preservedMessageIds - Optional array of message IDs that should be preserved
- *   after compaction. Used during emergency compaction to track which recent messages
- *   were not sent to the model but should be restored after the summary.
+ * Create the compact_conversation tool for the model to call.
  */
-export function createCompactionTool(
-  preservedMessageIds?: string[]
-): Record<typeof COMPACT_CONVERSATION_TOOL_NAME, Tool> {
+export function createCompactionTool(): Record<
+  typeof COMPACT_CONVERSATION_TOOL_NAME,
+  Tool
+> {
   return {
     [COMPACT_CONVERSATION_TOOL_NAME]: tool({
       description: `Compact the conversation history to save context space. Call this tool when instructed that the conversation is approaching context limits. Provide a detailed and thorough summary that captures:
@@ -206,15 +71,11 @@ Be thorough and detailed. This summary will replace the earlier conversation his
           ),
       }),
       execute: async ({ summary }) => {
-        // The summary is stored in the tool result and will be processed
-        // by applyCompaction() on subsequent messages
         return {
           summary,
           compacted_at: new Date().toISOString(),
           message:
             "Conversation history has been compacted. The summary will be used to maintain context in future messages.",
-          ...(preservedMessageIds &&
-            preservedMessageIds.length > 0 && { preservedMessageIds }),
         };
       },
     }),
@@ -222,28 +83,138 @@ Be thorough and detailed. This summary will replace the earlier conversation his
 }
 
 /**
- * Creates a compaction request message asking the model to summarize the conversation.
- * Uses a consistent ID ("compaction-request") for retry detection.
+ * Check if a message part is a compaction marker.
  */
-export function createCompactionMessage(options?: {
-  tokenCount?: number;
-  threshold?: number;
-}): Message {
-  let contextInfo = "";
-  if (options?.tokenCount && options?.threshold) {
-    const percentUsed = Math.round(
-      (options.tokenCount / options.threshold) * 100
-    );
-    contextInfo = `\n\nThe conversation has used approximately ${percentUsed}% of the available context (${options.tokenCount.toLocaleString()} tokens).`;
-  }
+function isCompactionMarkerPart(part: Message["parts"][number]): boolean {
+  return (
+    (part.type === "dynamic-tool" &&
+      "toolName" in part &&
+      part.toolName === COMPACTION_MARKER_TOOL_NAME) ||
+    part.type === `tool-${COMPACTION_MARKER_TOOL_NAME}`
+  );
+}
 
+/**
+ * Check if a message part is a compaction summary.
+ */
+function isCompactionSummaryPart(part: Message["parts"][number]): boolean {
+  return (
+    (part.type === `tool-${COMPACT_CONVERSATION_TOOL_NAME}` ||
+      (part.type === "dynamic-tool" &&
+        "toolName" in part &&
+        part.toolName === COMPACT_CONVERSATION_TOOL_NAME)) &&
+    "state" in part &&
+    part.state === "output-available" &&
+    "output" in part
+  );
+}
+
+export interface CompactionMarkerPart {
+  type: "dynamic-tool";
+  toolName: typeof COMPACTION_MARKER_TOOL_NAME;
+  toolCallId: string;
+  state: "output-available";
+  input: {
+    model_intent: string;
+  };
+  output: string;
+}
+
+/**
+ * Create a synthetic tool call part for the compaction marker.
+ * This is emitted when an out-of-context error is detected.
+ */
+export function createCompactionMarkerPart(): CompactionMarkerPart {
+  return {
+    type: "dynamic-tool",
+    toolCallId: `compaction-marker-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
+    toolName: COMPACTION_MARKER_TOOL_NAME,
+    state: "output-available",
+    input: {
+      model_intent: "Out of context, compaction in progress...",
+    },
+    output:
+      "Compaction marker - this will trigger compaction on the next iteration",
+  };
+}
+
+interface CompactionSummaryResult {
+  summary: string;
+  compacted_at: string;
+}
+
+/**
+ * Find a successful compaction summary in the messages.
+ */
+export function findCompactionSummary(messages: Message[]): {
+  summary: string;
+  compactedAt: string;
+  messageIndex: number;
+} | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (message?.role !== "assistant") continue;
+
+    for (const part of message.parts) {
+      if (isCompactionSummaryPart(part) && "output" in part) {
+        const output = part.output as CompactionSummaryResult | undefined;
+        if (output?.summary) {
+          return {
+            summary: output.summary,
+            compactedAt: output.compacted_at,
+            messageIndex: i,
+          };
+        }
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Count consecutive compaction markers in the messages (markers without a summary in between).
+ * This is used to determine the retry count - each marker represents a failed compaction attempt.
+ *
+ * @param messages The messages to search
+ * @param beforeIndex Optional index to stop at (exclusive). If provided, only counts markers before this index.
+ */
+export function countCompactionMarkers(
+  messages: Message[],
+  beforeIndex?: number
+): number {
+  let count = 0;
+  const endIndex = beforeIndex ?? messages.length;
+  // Scan from the end (or beforeIndex) to find markers, stop if we find a summary
+  for (let i = endIndex - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (message?.role !== "assistant") {
+      continue;
+    }
+
+    for (const part of message.parts) {
+      if (isCompactionSummaryPart(part)) {
+        return count;
+      }
+      if (isCompactionMarkerPart(part)) {
+        count++;
+      }
+    }
+  }
+  return count;
+}
+
+/**
+ * Build the compaction request message that instructs the model to compact.
+ */
+export function buildCompactionRequestMessage(): Message {
   return {
     id: `compaction-request-${Date.now()}`,
     role: "user",
     parts: [
       {
         type: "text",
-        text: `[SYSTEM NOTICE - CONTEXT LIMIT]${contextInfo}
+        text: `[SYSTEM NOTICE - CONTEXT LIMIT]
+Your conversation has exceeded the context window.
 
 To prevent context overflow errors, please call the \`compact_conversation\` tool NOW to summarize the conversation history.
 
@@ -254,182 +225,177 @@ Provide a detailed and thorough summary that captures all important context, dec
 }
 
 /**
- * Options for preparing truncated messages.
+ * Build a summary message that replaces the compacted conversation history.
  */
-export interface PrepareTruncatedMessagesOptions {
-  /** All messages to consider for truncation */
-  messages: Message[];
-  /** Maximum token count for messages to process */
-  tokenLimit: number;
-  /** Model name for token counting */
-  modelName: string;
+export function buildCompactionSummaryMessages(
+  summary: string,
+  compactedAt: string
+): Message[] {
+  return [
+    {
+      id: "compaction-summary",
+      role: "user",
+      parts: [
+        {
+          type: "text",
+          text: `[CONVERSATION SUMMARY - Previously compacted at ${compactedAt}]
+
+${summary}
+
+---
+The conversation continues from this point.`,
+        },
+      ],
+    },
+    // Add an assistant response to make sure that, when the next message is a "user" message,
+    // the provider won't throw an error. Some APIs don't accept consecutive "user" messages.
+    {
+      id: "compaction-summary-response",
+      role: "assistant",
+      parts: [
+        {
+          type: "text",
+          text: "Acknowledged.",
+        },
+      ],
+    },
+  ] as const;
 }
 
 /**
- * Result of preparing truncated messages.
+ * Finds the most recent summary and applies it to the messages.
  */
-export interface PrepareTruncatedMessagesResult {
-  /** Messages to send for summarization (older messages, within token limit) */
-  messagesToProcess: Message[];
-  /** Messages to preserve and restore after compaction */
-  messagesToPreserve: Message[];
-}
-
-/**
- * Prepares messages for a truncated compaction attempt.
- * Accumulates messages from the start (oldest first) until adding more would exceed the token limit.
- *
- * @returns Messages split into those to process (summarize) and those to preserve
- */
-export async function prepareTruncatedMessages(
-  options: PrepareTruncatedMessagesOptions
-): Promise<PrepareTruncatedMessagesResult> {
-  const { messages, tokenLimit, modelName } = options;
-
-  if (messages.length === 0) {
-    return { messagesToProcess: [], messagesToPreserve: [] };
+function applySummaryToMessages(messages: Message[]): Message[] {
+  const summary = findCompactionSummary(messages);
+  if (!summary) {
+    return messages;
   }
+  const markerCount = countCompactionMarkers(messages, summary?.messageIndex);
+  const excludedMessagesStartIndex = findExcludedMessagesStartIndex(
+    messages.slice(0, summary.messageIndex),
+    markerCount
+  );
+  const summaryMessages = buildCompactionSummaryMessages(
+    summary.summary,
+    summary.compactedAt
+  );
+  const excludedMessages = messages
+    .slice(excludedMessagesStartIndex, summary.messageIndex)
+    .filter((m) => !m.parts.some((p) => isCompactionMarkerPart(p)));
 
-  // Convert all messages once and get per-message token counts
-  const converted = convertToModelMessages(messages, {
-    ignoreIncompleteToolCalls: true,
-  });
-  const { perMessage } = await countConversationTokens(converted, modelName);
+  return [
+    ...summaryMessages,
+    ...excludedMessages,
+    ...messages.slice(summary.messageIndex + 1),
+  ];
+}
 
-  // Find the split point by accumulating token counts
-  // until we would exceed the token limit
-  let splitPoint = 0;
-  let cumulativeTokens = 0;
-
-  for (let i = 0; i < perMessage.length; i++) {
-    cumulativeTokens += perMessage[i] ?? 0;
-    if (cumulativeTokens > tokenLimit) {
-      // Adding this message would exceed the limit
-      break;
+function findExcludedMessagesStartIndex(
+  messages: Message[],
+  markerCount: number
+): number {
+  if (markerCount <= 0) {
+    return messages.length;
+  }
+  let lastUserIndex = messages.length;
+  let found = 0;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (message?.role !== "user") {
+      continue;
     }
-    splitPoint = i + 1;
+    lastUserIndex = i;
+    found++;
+    if (found === markerCount) {
+      return lastUserIndex;
+    }
   }
-
-  // Ensure we have at least one message to process (if possible)
-  if (splitPoint === 0 && messages.length > 0) {
-    // Even the first message exceeds the limit, but we need to process something
-    splitPoint = 1;
-  }
-
-  const messagesToProcess = messages.slice(0, splitPoint);
-  const messagesToPreserve = messages.slice(splitPoint);
-
-  return {
-    messagesToProcess,
-    messagesToPreserve,
-  };
+  return 0;
 }
 
-/**
- * Options for processing compaction.
- */
-export interface ProcessCompactionOptions {
-  messages: Message[];
-  /** Soft threshold - triggers compaction when reached */
-  softTokenThreshold: number;
-  /** Hard threshold - max tokens to send for compaction; rest are preserved */
-  hardTokenThreshold: number;
-  model: LanguageModel | string;
-  logger: Logger;
-}
-
-/**
- * Result of processing compaction.
- */
-export interface ProcessCompactionResult {
-  messages: Message[];
-  compactionTool: Record<string, Tool>;
-}
-
-/**
- * Extracts model name from a LanguageModel or string.
- */
-function getModelName(model: LanguageModel | string): string {
-  if (typeof model === "string") {
-    return model;
+function transformMessagesForCompaction(messages: Message[]): Message[] {
+  const markerCount = countCompactionMarkers(messages);
+  if (markerCount === 0) {
+    return messages;
   }
-  if ("modelId" in model) {
-    return model.modelId;
-  }
-  return "anthropic/claude-sonnet-4";
-}
-
-/**
- * Processes messages for compaction.
- * Applies any existing compaction summary, checks token count against soft threshold,
- * and truncates at hard threshold when compacting.
- */
-export async function processCompaction(
-  options: ProcessCompactionOptions
-): Promise<ProcessCompactionResult> {
-  const { messages, softTokenThreshold, hardTokenThreshold, model, logger } =
-    options;
-
-  // Validate thresholds
-  if (softTokenThreshold >= hardTokenThreshold) {
-    throw new Error(
-      `Soft token threshold (${softTokenThreshold}) must be less than hard token threshold (${hardTokenThreshold})`
+  const excludedMessagesStartIndex = findExcludedMessagesStartIndex(
+    messages,
+    markerCount
+  );
+  if (excludedMessagesStartIndex === 0) {
+    throw new CompactionError(
+      "Cannot compact: would leave only the compaction request",
+      markerCount - 1
     );
   }
+  return [
+    ...messages.slice(0, excludedMessagesStartIndex),
+    buildCompactionRequestMessage(),
+  ];
+}
 
-  const modelName = getModelName(model);
-
-  // Apply compaction if a compaction summary exists in the message history
-  const compactedMessages = applyCompaction(messages);
-  if (compactedMessages.length === 0) {
-    return { messages: [], compactionTool: {} };
-  }
-
-  // Check token count and handle compaction
-  let preservedMessageIds: string[] | undefined;
-
-  // We need to convert messages to count tokens accurately
-  const tempConverted = convertToModelMessages(compactedMessages, {
-    ignoreIncompleteToolCalls: true,
-  });
-  const { total: tokenCount } = await countConversationTokens(
-    tempConverted,
-    modelName
+/**
+ * Apply compaction logic to messages, handling both summary application and compaction requests.
+ *
+ * This function is the main entry point for the compaction system. It processes messages
+ * in two phases:
+ *
+ * ## Phase 1: Apply existing summaries (`applySummaryToMessages`)
+ * If the messages contain a successful `compact_conversation` tool result (a summary),
+ * this phase replaces the earlier conversation history with:
+ * 1. Summary messages (user message with summary + assistant acknowledgment)
+ * 2. Messages that were excluded when building the compaction request (restored here because
+ *    they weren't in the context when the model wrote the summary). These are the last N
+ *    user turns before the summary, where N = marker count before the summary.
+ * 3. Messages after the summary
+ *
+ * **Multiple summaries**: Only the most recent summary is used. Earlier summaries are
+ * discarded because the model had them in context when generating the newer summary,
+ * so their content should be incorporated. Summaries are cumulative, not layered.
+ *
+ * ## Phase 2: Transform for compaction request (`transformMessagesForCompaction`)
+ * If compaction markers are present (indicating out-of-context errors were caught),
+ * this phase:
+ * 1. Counts consecutive markers to determine retry count
+ * 2. Excludes the last N user message "turns" (where N = marker count). Each marker
+ *    represents an out-of-context error, meaning the conversation was too long for the
+ *    model to process. By excluding more messages on each retry, we reduce the input
+ *    size so the model has room to generate the summary.
+ * 3. Appends a compaction request message asking the model to call `compact_conversation`
+ *
+ * ## Retry mechanism
+ * Each compaction marker represents an out-of-context error. The first marker typically
+ * comes from normal operation (the conversation grew too long). Subsequent markers
+ * indicate that even the compaction request itself was too long. On each retry, more
+ * messages are excluded to give the model room to generate the summary. If all messages
+ * would be excluded, throws `CompactionError`.
+ *
+ * ## Flow example
+ * 1. Model hits context limit → `processStreamTextOutput` emits compaction marker
+ * 2. Next iteration calls this function
+ * 3. Messages are truncated + compaction request appended
+ * 4. Model calls `compact_conversation` with summary
+ * 5. Next iteration: summary is applied, old messages replaced
+ *
+ * @param messages - The full conversation message history
+ * @returns Transformed messages ready to send to the model
+ * @throws {CompactionError} If compaction would leave no messages (too many retries)
+ */
+export function applyCompactionToMessages(messages: Message[]): Message[] {
+  const currentConversation = applySummaryToMessages(messages);
+  const transformedMessages =
+    transformMessagesForCompaction(currentConversation);
+  return transformedMessages.filter(
+    (message) => !message.parts.some((part) => isCompactionMarkerPart(part))
   );
+}
 
-  if (tokenCount < softTokenThreshold) {
-    return { messages: compactedMessages, compactionTool: {} };
+export class CompactionError extends Error {
+  constructor(
+    message: string,
+    public readonly retryCount: number
+  ) {
+    super(message);
+    this.name = "CompactionError";
   }
-
-  // Soft threshold reached - trigger compaction
-  logger.info(
-    `Conversation approaching context limit: ${tokenCount.toLocaleString()} tokens (soft threshold: ${softTokenThreshold.toLocaleString()})`
-  );
-
-  // Truncate messages at hard threshold to ensure compaction request fits
-  const { messagesToProcess, messagesToPreserve } =
-    await prepareTruncatedMessages({
-      messages: compactedMessages,
-      tokenLimit: hardTokenThreshold,
-      modelName,
-    });
-
-  // Store preserved message IDs for the compaction tool result
-  if (messagesToPreserve.length > 0) {
-    preservedMessageIds = messagesToPreserve.map((m) => m.id);
-    logger.info(
-      `Compaction: sending ${messagesToProcess.length} messages for summarization, preserving ${messagesToPreserve.length} recent messages`
-    );
-  }
-
-  return {
-    messages: [
-      ...messagesToProcess,
-      createCompactionMessage({
-        tokenCount,
-        threshold: softTokenThreshold,
-      }),
-    ],
-    compactionTool: createCompactionTool(preservedMessageIds),
-  };
 }

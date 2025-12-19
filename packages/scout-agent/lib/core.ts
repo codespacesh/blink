@@ -4,13 +4,19 @@ import type * as github from "@blink-sdk/github";
 import withModelIntent from "@blink-sdk/model-intent";
 import * as slack from "@blink-sdk/slack";
 import type { App } from "@slack/bolt";
-import { convertToModelMessages, type LanguageModel, type Tool } from "ai";
+import {
+  convertToModelMessages,
+  type LanguageModel,
+  type StreamTextTransform,
+  type Tool,
+  type ToolSet,
+} from "ai";
 import type * as blink from "blink";
 import {
   applyCompactionToMessages,
-  createCompactionMarkerPart,
+  CompactionError,
+  createCompactionTransform,
   createCompactionTool,
-  isOutOfContextError,
 } from "./compaction";
 import {
   type CoderApiClient,
@@ -40,7 +46,8 @@ import { createSlackApp, createSlackTools, getSlackMetadata } from "./slack";
 import type { Message } from "./types";
 import { createWebSearchTools } from "./web-search";
 
-type Tools = Partial<ReturnType<typeof createSlackTools>> &
+type Tools = ToolSet &
+  Partial<ReturnType<typeof createSlackTools>> &
   Partial<ReturnType<typeof createGitHubTools>> &
   Record<string, Tool>;
 
@@ -345,6 +352,7 @@ export class Scout {
     maxOutputTokens: number;
     providerOptions?: ProviderOptions;
     tools: Tools;
+    experimental_transform?: StreamTextTransform<Tools>;
   }> {
     this.printConfigWarnings();
 
@@ -462,6 +470,25 @@ export class Scout {
       }
     }
 
+    let compactionEnabled = compaction;
+    let messagesToConvert = messages;
+    if (compactionEnabled) {
+      try {
+        messagesToConvert = applyCompactionToMessages(messages);
+      } catch (error) {
+        if (error instanceof CompactionError) {
+          this.logger.warn(
+            "Disabling compaction due to repeated compaction failures",
+            error
+          );
+          compactionEnabled = false;
+          messagesToConvert = messages;
+        } else {
+          throw error;
+        }
+      }
+    }
+
     const tools = {
       ...(this.webSearch.config
         ? createWebSearchTools({ exaApiKey: this.webSearch.config.exaApiKey })
@@ -478,7 +505,7 @@ export class Scout {
         : undefined),
       ...computeTools,
       // Always include compaction tool when compaction is enabled (for caching purposes)
-      ...(compaction ? createCompactionTool() : {}),
+      ...(compactionEnabled ? createCompactionTool() : {}),
       ...providedTools,
     };
 
@@ -490,10 +517,6 @@ Very frequently report your Slack status - you can report it in parallel as you 
 ${slack.formattingRules}
 </formatting-rules>`;
     }
-
-    const messagesToConvert = compaction
-      ? applyCompactionToMessages(messages)
-      : messages;
 
     const converted = convertToModelMessages(messagesToConvert, {
       ignoreIncompleteToolCalls: true,
@@ -518,109 +541,9 @@ ${slack.formattingRules}
       maxOutputTokens: 64_000,
       providerOptions,
       tools: withModelIntent(tools),
+      experimental_transform: compactionEnabled
+        ? createCompactionTransform()
+        : undefined,
     };
-  }
-
-  /**
-   * Process the output from streamText, intercepting out-of-context errors
-   * and replacing them with compaction markers.
-   *
-   * @param stream - The StreamTextResult from the AI SDK's streamText()
-   * @param options - Optional callbacks
-   * @returns The same stream, but with toUIMessageStream wrapped to handle errors
-   */
-  processStreamTextOutput<
-    // biome-ignore lint/suspicious/noExplicitAny: toUIMessageStream has complex overloaded signature
-    T extends { toUIMessageStream: (...args: any[]) => any },
-  >(
-    stream: T,
-    options?: {
-      onCompactionTriggered?: () => void;
-    }
-  ): T {
-    // Use a Proxy to wrap toUIMessageStream
-    return new Proxy(stream, {
-      get(target, prop) {
-        // Wrap toUIMessageStream to intercept out-of-context errors
-        if (prop === "toUIMessageStream") {
-          const originalMethod = target.toUIMessageStream;
-          return (...args: unknown[]) => {
-            const uiStream = originalMethod.apply(target, args);
-
-            // Helper to emit compaction marker chunks
-            const emitCompactionMarker = (
-              controller: ReadableStreamDefaultController
-            ) => {
-              options?.onCompactionTriggered?.();
-              const markerPart = createCompactionMarkerPart();
-              controller.enqueue({
-                type: "tool-input-start",
-                toolCallId: markerPart.toolCallId,
-                toolName: markerPart.toolName,
-              });
-              controller.enqueue({
-                type: "tool-input-available",
-                toolCallId: markerPart.toolCallId,
-                toolName: markerPart.toolName,
-                input: markerPart.input,
-              });
-              controller.enqueue({
-                type: "tool-output-available",
-                toolCallId: markerPart.toolCallId,
-                output: markerPart.output,
-                preliminary: false,
-              });
-            };
-
-            // Use a custom ReadableStream to handle both error chunks and mid-stream errors
-            // This approach catches errors from controller.error() which TransformStream doesn't handle
-            return new ReadableStream({
-              async start(controller) {
-                const reader = uiStream.getReader();
-                try {
-                  while (true) {
-                    const { done, value: chunk } = await reader.read();
-                    if (done) break;
-
-                    // Check if this is an error chunk in UI format
-                    if (
-                      chunk &&
-                      typeof chunk === "object" &&
-                      "type" in chunk &&
-                      chunk.type === "error" &&
-                      "errorText" in chunk &&
-                      typeof chunk.errorText === "string" &&
-                      isOutOfContextError(new Error(chunk.errorText))
-                    ) {
-                      emitCompactionMarker(controller);
-                      continue;
-                    }
-                    controller.enqueue(chunk);
-                  }
-                  controller.close();
-                } catch (error) {
-                  // Mid-stream error via controller.error() - check if it's out of context
-                  if (isOutOfContextError(error)) {
-                    emitCompactionMarker(controller);
-                    controller.close();
-                  } else {
-                    controller.error(error);
-                  }
-                } finally {
-                  reader.releaseLock();
-                }
-              },
-            });
-          };
-        }
-
-        const value = target[prop as keyof T];
-        // Bind functions to the original target to preserve 'this' context
-        if (typeof value === "function") {
-          return value.bind(target);
-        }
-        return value;
-      },
-    }) as T;
   }
 }

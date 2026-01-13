@@ -35,6 +35,7 @@ export default async function deploy(
 
   const token = await loginIfNeeded();
   const client = new Client({
+    baseURL: getHost(),
     authToken: token,
     // @ts-ignore - This is just because of Bun.
     fetch: (url, init) => {

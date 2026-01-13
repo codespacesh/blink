@@ -5,16 +5,25 @@
 // After any edits are made, run `./scripts/generate.ts` to
 // regenerate this file. The generated file is source-controlled.
 
-import { BlinkInvocationTokenHeader } from "@blink.so/runtime/types";
+import {
+  BlinkInvocationAuthTokenEnvironmentVariable,
+  BlinkInvocationTokenHeader,
+} from "@blink.so/runtime/types";
+import { runWithAuth } from "blink/internal";
 import { resolve } from "node:path";
 import { Writable } from "node:stream";
-import { startAgentServer, startInternalAPIServer } from "../server";
+import {
+  patchFetchWithAuth,
+  startAgentServer,
+  startInternalAPIServer,
+} from "../server";
 
-const { setAuthToken, server, port } = startInternalAPIServer();
+const { server, port } = startInternalAPIServer();
 // It is *extremely* important for Lambda's that we unref the server.
 // Otherwise, the Lambda will not exit when requests are made.
 // It will hang until the timeout.
 server.unref();
+patchFetchWithAuth(`http://127.0.0.1:${port}`);
 
 if (!process.env.ENTRYPOINT) {
   throw new Error("developer error: ENTRYPOINT is not set");
@@ -29,48 +38,58 @@ const agent = await startAgentServer(
 
 export const handler = awslambda.streamifyResponse(
   async (event, responseStream, context) => {
-    // This prevents Lambda's from staying alive after we respond to a request.
-    // context.callbackWaitsForEmptyEventLoop = false;
-
-    // Lambda's never handle requests concurrently, but they do sequentially.
-    //
-    // We can just reset the waitUntil func at the beginning of requests
-    // to ensure they get a clean context.
-    //
-    // This is an internal symbol we use to expose waitUntil to agent code.
-    // It's not exported from the runtime package, so it's safe to use.
-    // We use a Symbol to avoid collisions with other libraries.
-    const waitUntilSymbol = Symbol.for("@blink/waitUntil");
-    // Storage for promises registered via waitUntil
-    const waitUntilPromises: Promise<any>[] = [];
-    // Expose waitUntil on globalThis
-    (globalThis as any)[waitUntilSymbol] = (promise: Promise<any>) => {
-      waitUntilPromises.push(promise);
-    };
-
-    const isV2 = "rawPath" in event;
-    const path = isV2 ? event.rawPath : event.path;
-    const query = isV2
-      ? event.rawQueryString
-      : new URLSearchParams(event.queryStringParameters || {}).toString();
-    const method = isV2 ? event.requestContext?.http?.method : event.httpMethod;
-
-    const url = new URL(
-      path + (query ? `?${query}` : ""),
-      "https://lambda.internal"
-    );
-
-    // Build canonical Headers
+    // Build canonical Headers first to extract auth token
     const headers = buildHeaders(event);
 
-    // Strip Blink header (case-insensitive)
+    // Extract and strip Blink auth token (case-insensitive)
+    let authToken: string | undefined;
     for (const [k, v] of headers.entries()) {
       if (k.toLowerCase() === BlinkInvocationTokenHeader.toLowerCase()) {
-        setAuthToken(v);
+        authToken = v;
         headers.delete(k);
         break;
       }
     }
+
+    // Legacy: Set env var for older blink package versions that don't use ALS.
+    // This is safe for Lambda since it handles one request at a time.
+    process.env[BlinkInvocationAuthTokenEnvironmentVariable] = authToken ?? "";
+
+    // Use AsyncLocalStorage to ensure each request has its own auth context.
+    // The patched fetch will read from this context when making internal API requests.
+    return runWithAuth(authToken ?? "", async () => {
+      // This prevents Lambda's from staying alive after we respond to a request.
+      // context.callbackWaitsForEmptyEventLoop = false;
+
+      // Lambda's never handle requests concurrently, but they do sequentially.
+      //
+      // We can just reset the waitUntil func at the beginning of requests
+      // to ensure they get a clean context.
+      //
+      // This is an internal symbol we use to expose waitUntil to agent code.
+      // It's not exported from the runtime package, so it's safe to use.
+      // We use a Symbol to avoid collisions with other libraries.
+      const waitUntilSymbol = Symbol.for("@blink/waitUntil");
+      // Storage for promises registered via waitUntil
+      const waitUntilPromises: Promise<any>[] = [];
+      // Expose waitUntil on globalThis
+      (globalThis as any)[waitUntilSymbol] = (promise: Promise<any>) => {
+        waitUntilPromises.push(promise);
+      };
+
+      const isV2 = "rawPath" in event;
+      const path = isV2 ? event.rawPath : event.path;
+      const query = isV2
+        ? event.rawQueryString
+        : new URLSearchParams(event.queryStringParameters || {}).toString();
+      const method = isV2
+        ? event.requestContext?.http?.method
+        : event.httpMethod;
+
+      const url = new URL(
+        path + (query ? `?${query}` : ""),
+        "https://lambda.internal"
+      );
 
     let body: string | Buffer | undefined;
     if (event.body != null && method !== "GET" && method !== "HEAD") {
@@ -169,6 +188,7 @@ export const handler = awslambda.streamifyResponse(
         clearTimeout(flushTimeout);
       }
     }
+    }); // end runWithAuth
   }
 );
 

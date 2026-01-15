@@ -110,6 +110,36 @@ export interface TraceOptions {
   chat_id?: string;
 }
 
+/**
+ * Extracts run_id, step_id, and chat_id from span attributes.
+ * Looks for flat attribute keys: blink.run_id, blink.step_id, blink.chat_id
+ */
+function extractBlinkIdsFromSpan(span: Span): {
+  run_id?: string;
+  step_id?: string;
+  chat_id?: string;
+} {
+  const result: { run_id?: string; step_id?: string; chat_id?: string } = {};
+
+  if (!span.attributes) {
+    return result;
+  }
+
+  for (const attr of span.attributes) {
+    if (attr.value?.value.case === "stringValue") {
+      if (attr.key === "blink.run_id") {
+        result.run_id = attr.value.value.value;
+      } else if (attr.key === "blink.step_id") {
+        result.step_id = attr.value.value.value;
+      } else if (attr.key === "blink.chat_id") {
+        result.chat_id = attr.value.value.value;
+      }
+    }
+  }
+
+  return result;
+}
+
 export function mapExportTraceServiceRequestToOtelSpans(
   request: ExportTraceServiceRequest,
   options: TraceOptions
@@ -131,22 +161,13 @@ function mapResourceSpans(
     resourceSpans.resource?.attributes ?? []
   );
 
-  resourceAttrs.blink = {
-    agent_id: options.agent_id,
-    deployment_id: options.deployment_id,
-    deployment_target_id: options.deployment_target_id,
-    ...(options.run_id ? { run_id: options.run_id } : {}),
-    ...(options.step_id ? { step_id: options.step_id } : {}),
-    ...(options.chat_id ? { chat_id: options.chat_id } : {}),
-  };
-
   const rows: OtelSpan[] = [];
 
   for (const scopeSpans of resourceSpans.scopeSpans) {
     rows.push(
       ...mapScopeSpans({
         scopeSpans,
-        agentId: options.agent_id,
+        options,
         resourceAttributes: resourceAttrs,
         resourceDroppedAttributesCount:
           resourceSpans.resource?.droppedAttributesCount ?? 0,
@@ -160,7 +181,7 @@ function mapResourceSpans(
 
 function mapScopeSpans(args: {
   scopeSpans: ScopeSpans;
-  agentId: string;
+  options: TraceOptions;
 
   resourceAttributes: Record<string, unknown>;
   resourceDroppedAttributesCount: number;
@@ -168,7 +189,7 @@ function mapScopeSpans(args: {
 }): OtelSpan[] {
   const {
     scopeSpans,
-    agentId,
+    options,
     resourceAttributes,
     resourceSchemaUrl,
     resourceDroppedAttributesCount,
@@ -188,7 +209,7 @@ function mapScopeSpans(args: {
     spanRows.push(
       mapSpan({
         span,
-        agentId,
+        options,
         resourceAttributes,
         resourceDroppedAttributesCount,
         resourceSchemaUrl,
@@ -206,7 +227,7 @@ function mapScopeSpans(args: {
 
 function mapSpan(args: {
   span: Span;
-  agentId: string;
+  options: TraceOptions;
   resourceAttributes: Record<string, unknown>;
   resourceDroppedAttributesCount: number;
   resourceSchemaUrl?: string | undefined;
@@ -218,7 +239,7 @@ function mapSpan(args: {
 }): OtelSpan {
   const {
     span,
-    agentId,
+    options,
     resourceAttributes,
     resourceDroppedAttributesCount,
     resourceSchemaUrl,
@@ -230,6 +251,46 @@ function mapSpan(args: {
   } = args;
 
   const spanAttributes = keyValuesToRecord(span.attributes ?? []);
+
+  // Extract IDs from span attributes if not provided in options
+  const extractedIds =
+    options.run_id === undefined ||
+    options.step_id === undefined ||
+    options.chat_id === undefined
+      ? extractBlinkIdsFromSpan(span)
+      : {};
+
+  const run_id = options.run_id ?? extractedIds.run_id;
+  const step_id = options.step_id ?? extractedIds.step_id;
+  const chat_id = options.chat_id ?? extractedIds.chat_id;
+
+  // Remove blink.* ID keys from span attributes (they've been moved to resource.attributes.blink)
+  // Note: keyValuesToRecord converts "blink.run_id" to nested { blink: { run_id: ... } }
+  // so we need to delete the nested properties, not flat keys
+  const blinkAttrs = spanAttributes.blink;
+  if (blinkAttrs && typeof blinkAttrs === "object") {
+    const blink = blinkAttrs as Record<string, unknown>;
+    delete blink.run_id;
+    delete blink.step_id;
+    delete blink.chat_id;
+    // Remove blink object entirely if empty
+    if (Object.keys(blink).length === 0) {
+      delete spanAttributes.blink;
+    }
+  }
+
+  // Build resource attributes with blink info
+  const resourceAttrsWithBlink: Record<string, unknown> = {
+    ...resourceAttributes,
+    blink: {
+      agent_id: options.agent_id,
+      deployment_id: options.deployment_id,
+      deployment_target_id: options.deployment_target_id,
+      ...(run_id ? { run_id } : {}),
+      ...(step_id ? { step_id } : {}),
+      ...(chat_id ? { chat_id } : {}),
+    },
+  };
 
   const statusCode = normalizeStatusCode(span.status);
   const statusMessage = normalizeEmpty(span.status?.message) ?? "";
@@ -243,7 +304,7 @@ function mapSpan(args: {
   );
 
   return {
-    agent_id: agentId,
+    agent_id: options.agent_id,
     start_time: startTime,
     end_time: endTime,
     payload: {
@@ -266,7 +327,7 @@ function mapSpan(args: {
         links: mapLinks(span.links ?? []),
       },
       resource: {
-        attributes: resourceAttributes,
+        attributes: resourceAttrsWithBlink,
         dropped_attributes_count: resourceDroppedAttributesCount,
         schema_url: resourceSchemaUrl,
       },
@@ -318,10 +379,57 @@ function keyValuesToRecord(entries: KeyValue[]): Record<string, unknown> {
     if (!entry || !entry.key) {
       continue;
     }
-    result[entry.key] = anyValueToJson(entry.value);
+    setNestedValue(result, entry.key, anyValueToJson(entry.value));
   }
 
   return result;
+}
+
+/**
+ * Checks if a key could be used for prototype pollution attacks.
+ */
+function isPrototypePollutingKey(key: string): boolean {
+  return key === "__proto__" || key === "constructor" || key === "prototype";
+}
+
+/**
+ * Sets a value in a nested object structure using dot-notation key.
+ * For example, setNestedValue(obj, "foo.bar.baz", 123) creates { foo: { bar: { baz: 123 } } }
+ */
+function setNestedValue(
+  obj: Record<string, unknown>,
+  key: string,
+  value: unknown
+): void {
+  const parts = key.split(".");
+
+  // If no dots, just set directly
+  if (parts.length === 1) {
+    if (isPrototypePollutingKey(key)) {
+      return;
+    }
+    obj[key] = value;
+    return;
+  }
+
+  let current = obj;
+
+  for (let i = 0; i < parts.length - 1; i++) {
+    const part = parts[i] as string;
+    if (isPrototypePollutingKey(part)) {
+      return;
+    }
+    if (!(part in current) || !isPlainRecord(current[part])) {
+      current[part] = {};
+    }
+    current = current[part] as Record<string, unknown>;
+  }
+
+  const finalKey = parts[parts.length - 1] as string;
+  if (isPrototypePollutingKey(finalKey)) {
+    return;
+  }
+  current[finalKey] = value;
 }
 
 function anyValueToJson(value: AnyValue | undefined): unknown {
@@ -418,7 +526,7 @@ function formatUnixNano(unixNano: bigint): string {
   const secondsPart = padNumber(date.getUTCSeconds(), 2);
   const nanoPart = padNumber(nanos, 9);
 
-  return `${year}-${month}-${day} ${hours}:${minutes}:${secondsPart}.${nanoPart}`;
+  return `${year}-${month}-${day} ${hours}:${minutes}:${secondsPart}.${nanoPart}Z`;
 }
 
 function padNumber(value: number, length: number): string {

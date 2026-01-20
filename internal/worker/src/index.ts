@@ -116,6 +116,23 @@ export default instrument(
         });
       }
 
+      // This is how Mintlify promotes doing this.
+      if (/^\/docs/.test(url.pathname)) {
+        const DOCS_URL = "blink-8fc97cdb.mintlify.dev";
+        const CUSTOM_URL = "docs.blink.so";
+
+        let url = new URL(req.url);
+        url.hostname = DOCS_URL;
+
+        let proxyRequest = new Request(url, req);
+
+        proxyRequest.headers.set("Host", DOCS_URL);
+        proxyRequest.headers.set("X-Forwarded-Host", CUSTOM_URL);
+        proxyRequest.headers.set("X-Forwarded-Proto", "https");
+
+        return await fetch(proxyRequest);
+      }
+
       // For now, flag when we do this.
       if (
         url.pathname === "/api" ||

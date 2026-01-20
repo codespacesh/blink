@@ -14,6 +14,7 @@ routes = [
     { pattern = "blink.so/static/*", zone_name = "blink.so" },
     { pattern = "blink.coder.com/api/*", zone_name = "coder.com" },
     { pattern = "blink.coder.com/static/*", zone_name = "coder.com" },
+    { pattern = "blink.coder.com/docs*", zone_name = "coder.com" },
 
     { pattern = "*.blink.host/*", zone_name = "blink.host" },
     { pattern = "*.agent.blink.host/*", zone_name = "blink.host" },

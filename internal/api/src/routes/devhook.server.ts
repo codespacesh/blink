@@ -1,9 +1,13 @@
 import { validate } from "uuid";
+import { withDevhookAuth } from "../middleware";
 import type { APIServer } from "../server";
 import { createWebhookURL } from "../server-helper";
 
 export default function mountDevhook(server: APIServer) {
-  server.get("/:devhook/url", async (c) => {
+  // this endpoint is used by packages/server/src/server.ts
+  // to authorize the listen request. it must use the exact same auth
+  // method as the one required to listen on the matching devhook URL.
+  server.get("/:devhook/url", withDevhookAuth, async (c) => {
     const id = c.req.param("devhook");
     if (!validate(id)) {
       return c.json({ message: "Invalid devhook ID" }, 400);
@@ -20,7 +24,10 @@ export default function mountDevhook(server: APIServer) {
     return c.json({ url });
   });
 
-  server.get("/:devhook", async (c) => {
+  // this endpoint is somewhat misleading. in self-hosted mode,
+  // it's not used during the flow to listen on the devhook URL.
+  // websocket upgrade logic is handled in packages/server/src/server.ts
+  server.get("/:devhook", withDevhookAuth, async (c) => {
     const id = c.req.param("devhook");
     if (!validate(id)) {
       return c.json({ message: "Invalid devhook ID" }, 400);

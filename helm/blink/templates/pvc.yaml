@@ -1,0 +1,18 @@
+{{- if .Values.blink.persistence.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "blink.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "blink.labels" . | nindent 4 }}
+spec:
+  accessModes:
+    {{- toYaml .Values.blink.persistence.accessModes | nindent 4 }}
+  resources:
+    requests:
+      storage: {{ .Values.blink.persistence.size }}
+  {{- if .Values.blink.persistence.storageClass }}
+  storageClassName: {{ .Values.blink.persistence.storageClass | quote }}
+  {{- end }}
+{{- end }}

@@ -1,0 +1,51 @@
+{{- if .Values.blink.ingress.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "blink.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "blink.labels" . | nindent 4 }}
+  {{- with .Values.blink.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if .Values.blink.ingress.className }}
+  ingressClassName: {{ .Values.blink.ingress.className | quote }}
+  {{- end }}
+  rules:
+    - host: {{ .Values.blink.ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "blink.fullname" . }}
+                port:
+                  name: http
+    {{- if .Values.blink.ingress.wildcardHost }}
+    - host: {{ include "blink.ingressWildcardHost" . | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "blink.fullname" . }}
+                port:
+                  name: http
+    {{- end }}
+  {{- if .Values.blink.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ .Values.blink.ingress.host | quote }}
+      secretName: {{ .Values.blink.ingress.tls.secretName | quote }}
+    {{- if .Values.blink.ingress.tls.wildcardSecretName }}
+    - hosts:
+        - {{ include "blink.ingressWildcardHost" . | quote }}
+      secretName: {{ .Values.blink.ingress.tls.wildcardSecretName | quote }}
+    {{- end }}
+  {{- end }}
+{{- end }}

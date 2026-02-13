@@ -1,0 +1,22 @@
+{{- if .Values.blink.service.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "blink.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "blink.labels" . | nindent 4 }}
+  {{- with .Values.blink.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.blink.service.type }}
+  ports:
+    - name: http
+      port: {{ .Values.blink.service.port }}
+      targetPort: http
+      protocol: TCP
+  selector:
+    {{- include "blink.selectorLabels" . | nindent 4 }}
+{{- end }}

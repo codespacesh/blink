@@ -1,0 +1,167 @@
+name: Release (Docker + Helm)
+
+on:
+  release:
+    types: [released]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version tag (e.g. 0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/blink-server
+
+jobs:
+  # Build the server package (same as build-server-docker-image.yml)
+  build-package:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Build packages
+        run: bun run build
+
+      - name: Build server package with site
+        run: |
+          cd packages/server
+          BUILD_SITE=1 bun run build
+
+      - name: Pack server package
+        run: |
+          cd packages/server
+          npm pack
+          mv blink-server-*.tgz server.tgz
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-package
+          path: packages/server/server.tgz
+          retention-days: 1
+
+  # Build multi-arch Docker images
+  build-image:
+    needs: build-package
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download package artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: server-package
+          path: packages/server/docker/server
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: packages/server/docker/server
+          file: packages/server/docker/server/Dockerfile
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          provenance: false
+
+      - name: Upload digest
+        run: |
+          mkdir -p /tmp/digests
+          platform="${{ matrix.platform }}"
+          echo "${{ steps.build.outputs.digest }}" > "/tmp/digests/${platform//\//-}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          path: /tmp/digests/*
+          retention-days: 1
+
+  # Create multi-arch manifest and tag with version
+  create-manifest:
+    needs: build-image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - name: Log in to Container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push manifest
+        run: |
+          GIT_TAG="${{ github.event.release.tag_name || inputs.tag }}"
+          DIGESTS=$(for digest in /tmp/digests/*; do echo "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@$(cat $digest)"; done)
+
+          # Tag with version
+          docker manifest create "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${GIT_TAG}" $DIGESTS
+          docker manifest push "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${GIT_TAG}"
+
+          # Tag as latest
+          docker manifest create "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest" $DIGESTS
+          docker manifest push "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+
+  # Package and push Helm chart
+  helm:
+    needs: create-manifest
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Log in to Helm OCI registry
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Package Helm chart
+        run: |
+          GIT_TAG="${{ github.event.release.tag_name || inputs.tag }}"
+          helm package helm/blink/ \
+            --version "${GIT_TAG}" \
+            --app-version "${GIT_TAG}"
+
+      - name: Push Helm chart to GHCR
+        run: |
+          GIT_TAG="${{ github.event.release.tag_name || inputs.tag }}"
+          helm push "blink-${GIT_TAG}.tgz" oci://ghcr.io/${{ github.repository_owner }}/chart

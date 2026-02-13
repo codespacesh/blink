@@ -1,0 +1,120 @@
+blink:
+  image:
+    repo: "ghcr.io/coder/blink-server"
+    tag: ""  # defaults to Chart.AppVersion
+    pullPolicy: IfNotPresent
+    pullSecrets: []
+
+  # Blink Server configuration
+  accessUrl: ""           # e.g. https://blink.tenant.codespace.sh
+  wildcardAccessUrl: ""   # e.g. *.blink.tenant.codespace.sh
+  agentImage: "ghcr.io/coder/blink-agent:latest"
+  enableSignups: "false"
+
+  # PostgreSQL connection
+  postgres:
+    # Use an existing secret containing BLINK_POSTGRES_URL
+    existingSecret: ""
+    existingSecretKey: "url"
+    # Or provide the URL directly (not recommended for production)
+    url: ""
+
+  # Auth secret
+  auth:
+    # Use an existing secret containing BLINK_AUTH_SECRET
+    existingSecret: ""
+    existingSecretKey: "secret"
+    # Or provide directly (not recommended for production)
+    secret: ""
+
+  # Additional environment variables
+  env: []
+  #  - name: BLINK_TUNNEL_SERVER_URL
+  #    value: "https://try.blink.host"
+
+  # Sysbox runtime for nested Docker (agent containers)
+  runtimeClassName: "sysbox-runc"
+
+  # Replica count
+  replicaCount: 1
+
+  # Resource limits
+  resources: {}
+  #  limits:
+  #    cpu: 2000m
+  #    memory: 4096Mi
+  #  requests:
+  #    cpu: 500m
+  #    memory: 512Mi
+
+  # Security context
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+
+  podSecurityContext: {}
+
+  # Persistent volume for config (auth-secret.txt, etc.)
+  persistence:
+    enabled: true
+    size: 1Gi
+    storageClass: ""
+    accessModes:
+      - ReadWriteOnce
+
+  # Health probes
+  readinessProbe:
+    enabled: true
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  livenessProbe:
+    enabled: true
+    initialDelaySeconds: 15
+    periodSeconds: 30
+    timeoutSeconds: 5
+    failureThreshold: 5
+
+  # Service configuration
+  service:
+    enabled: true
+    type: ClusterIP
+    port: 80
+    annotations: {}
+
+  # Ingress configuration
+  ingress:
+    enabled: false
+    className: ""
+    annotations: {}
+    host: ""
+    wildcardHost: ""
+    tls:
+      enabled: false
+      secretName: ""
+      wildcardSecretName: ""
+
+  # Service account
+  serviceAccount:
+    create: true
+    name: ""
+    annotations: {}
+    labels: {}
+
+  # Pod scheduling
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  topologySpreadConstraints: []
+
+  # Pod metadata
+  annotations: {}
+  labels: {}
+  podAnnotations: {}
+  podLabels: {}
+
+  # Extra volumes and mounts
+  volumes: []
+  volumeMounts: []

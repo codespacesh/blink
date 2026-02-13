@@ -1,0 +1,16 @@
+Blink Server has been deployed!
+
+{{- if .Values.blink.accessUrl }}
+Access URL: {{ .Values.blink.accessUrl }}
+{{- end }}
+
+{{- if .Values.blink.ingress.enabled }}
+Ingress host: {{ .Values.blink.ingress.host }}
+{{- else }}
+
+To access Blink Server, run:
+  kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "blink.fullname" . }} 3005:{{ .Values.blink.service.port }}
+  Then open http://localhost:3005
+{{- end }}
+
+For more information, visit https://github.com/codespacesh/blink

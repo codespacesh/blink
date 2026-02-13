@@ -1,0 +1,160 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "blink.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "blink.labels" . | nindent 4 }}
+    {{- with .Values.blink.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with .Values.blink.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  replicas: {{ .Values.blink.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "blink.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "blink.labels" . | nindent 8 }}
+        {{- with .Values.blink.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with .Values.blink.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "blink.serviceAccountName" . }}
+      {{- with .Values.blink.runtimeClassName }}
+      runtimeClassName: {{ . | quote }}
+      {{- end }}
+      {{- with .Values.blink.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
+      {{- with .Values.blink.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.blink.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.blink.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.blink.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.blink.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: blink-server
+          image: {{ include "blink.image" . | quote }}
+          imagePullPolicy: {{ .Values.blink.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 3005
+              protocol: TCP
+          env:
+            - name: BLINK_HOST
+              value: "0.0.0.0"
+            - name: BLINK_PORT
+              value: "3005"
+            {{- if .Values.blink.accessUrl }}
+            - name: BLINK_ACCESS_URL
+              value: {{ .Values.blink.accessUrl | quote }}
+            {{- end }}
+            {{- if .Values.blink.wildcardAccessUrl }}
+            - name: BLINK_WILDCARD_ACCESS_URL
+              value: {{ .Values.blink.wildcardAccessUrl | quote }}
+            {{- end }}
+            - name: BLINK_AGENT_IMAGE
+              value: {{ .Values.blink.agentImage | quote }}
+            - name: BLINK_ENABLE_SIGNUPS
+              value: {{ .Values.blink.enableSignups | quote }}
+            # PostgreSQL URL
+            {{- if .Values.blink.postgres.existingSecret }}
+            - name: BLINK_POSTGRES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.blink.postgres.existingSecret }}
+                  key: {{ .Values.blink.postgres.existingSecretKey }}
+            {{- else if .Values.blink.postgres.url }}
+            - name: BLINK_POSTGRES_URL
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "blink.fullname" . }}
+                  key: postgres-url
+            {{- end }}
+            # Auth secret
+            {{- if .Values.blink.auth.existingSecret }}
+            - name: BLINK_AUTH_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.blink.auth.existingSecret }}
+                  key: {{ .Values.blink.auth.existingSecretKey }}
+            {{- else if .Values.blink.auth.secret }}
+            - name: BLINK_AUTH_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "blink.fullname" . }}
+                  key: auth-secret
+            {{- end }}
+            {{- with .Values.blink.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- if .Values.blink.readinessProbe.enabled }}
+          readinessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: {{ .Values.blink.readinessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.blink.readinessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.blink.readinessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.blink.readinessProbe.failureThreshold }}
+          {{- end }}
+          {{- if .Values.blink.livenessProbe.enabled }}
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: {{ .Values.blink.livenessProbe.initialDelaySeconds }}
+            periodSeconds: {{ .Values.blink.livenessProbe.periodSeconds }}
+            timeoutSeconds: {{ .Values.blink.livenessProbe.timeoutSeconds }}
+            failureThreshold: {{ .Values.blink.livenessProbe.failureThreshold }}
+          {{- end }}
+          {{- with .Values.blink.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.blink.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            {{- if .Values.blink.persistence.enabled }}
+            - name: blink-config
+              mountPath: /home/server/.config/blink-server
+            {{- end }}
+            {{- with .Values.blink.volumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        {{- if .Values.blink.persistence.enabled }}
+        - name: blink-config
+          persistentVolumeClaim:
+            claimName: {{ include "blink.fullname" . }}-config
+        {{- end }}
+        {{- with .Values.blink.volumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}

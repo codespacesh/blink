@@ -1,0 +1,22 @@
+apiVersion: v2
+name: blink
+description: Blink Server - self-hosted platform for building and running AI agents
+home: https://github.com/codespacesh/blink
+type: application
+
+# version and appVersion are injected at release. If installing directly from
+# git, set blink.image.tag manually.
+version: "0.1.0"
+appVersion: "0.1.0"
+
+kubeVersion: ">= 1.19.0-0"
+
+keywords:
+  - blink
+  - ai-agents
+  - coder
+sources:
+  - https://github.com/codespacesh/blink
+maintainers:
+  - name: Codespace
+    url: https://codespace.sh
